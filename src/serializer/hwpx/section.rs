@@ -1089,6 +1089,11 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
     let mut text_buf = String::new();
     let mut slot_idx = 0usize;
     let mut expected_utf16_pos = 0u32;
+    // 지나온 8 유닛 항목 수 — HWP5 출처 인라인 제어 문자(제목 차례 표시 등)의 갭을
+    // 알아보기 위한 순번. 그 갭은 HWPX 로 옮길 수 없어 비워 두되, 다음 슬롯이 가로채
+    // 앞으로 당겨지지 않게 한다.
+    let mut unit_seq = 0u32;
+    let mut inline_idx = 0usize;
     let mut field_end_emitted = vec![false; para.field_ranges.len()];
     // [Task #1556] 고아 fieldEnd 방출 추적.
     let mut orphan_emitted = vec![false; para.orphan_field_ends.len()];
@@ -1115,11 +1120,13 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             render_control_slot(&mut splitter.content, slots[slot_idx], ctx);
             slot_idx += 1;
             expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+            unit_seq += 1;
         }
         for (i, fr) in para.field_ranges.iter().enumerate() {
             if fr.start_char_idx == fr.end_char_idx && !field_end_emitted[i] {
                 emit_field_end_at(&mut splitter, para, fr, expected_utf16_pos);
                 expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                unit_seq += 1;
                 field_end_emitted[i] = true;
             }
         }
@@ -1129,6 +1136,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
                 splitter.cut_before(expected_utf16_pos);
                 emit_orphan_field_end(&mut splitter.content, ofe);
                 expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                unit_seq += 1;
                 orphan_emitted[i] = true;
             }
         }
@@ -1144,6 +1152,16 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
         // 슬롯이 아니라 fieldEnd 소유다. 슬롯 방출을 양보해 텍스트-끝 슬롯(newNum 등)이
         // fieldEnd 자리를 가로채지 못하게 한다 (0-length 필드는 아래 pre-char 경로가 처리).
         while slot_idx < slots.len() && char_pos >= expected_utf16_pos.saturating_add(8) {
+            if para
+                .inline_ctrl_chars
+                .get(inline_idx)
+                .is_some_and(|c| c.slot <= unit_seq)
+            {
+                inline_idx += 1;
+                unit_seq += 1;
+                expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                continue;
+            }
             // [Issue #1948] 이 갭(expected_utf16_pos)이 미방출 **고아(교차 문단)
             // fieldEnd** 소유면 슬롯 방출을 양보한다. 종전엔 field_ranges 의 fieldEnd
             // 만 갭을 지켰고(위 주석 #1407) 고아 fieldEnd 는 while 뒤(char_idx==idx)에서
@@ -1165,6 +1183,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
                 splitter.cut_before(expected_utf16_pos);
                 emit_orphan_field_end(&mut splitter.content, &para.orphan_field_ends[oi]);
                 expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                unit_seq += 1;
                 orphan_emitted[oi] = true;
                 continue;
             }
@@ -1188,6 +1207,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             let emitted_ctrl_idx = slot_ctrl_indices[slot_idx];
             slot_idx += 1;
             expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+            unit_seq += 1;
             // [Task #1893] 이 슬롯이 0-length 필드(start==end==idx)의 fieldBegin 이면
             // 그 fieldEnd 를 즉시 이어서 방출 — 같은 갭의 end 몫 8유닛을 다음 슬롯이
             // 가로채 begin 들이 연속 배치되면 재파스 LIFO 페어링이 교차된다
@@ -1200,6 +1220,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
                 {
                     emit_field_end_at(&mut splitter, para, fr, expected_utf16_pos);
                     expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                    unit_seq += 1;
                     field_end_emitted[i] = true;
                 }
             }
@@ -1217,6 +1238,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
                 splitter.cut_before(expected_utf16_pos);
                 emit_orphan_field_end(&mut splitter.content, ofe);
                 expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                unit_seq += 1;
                 orphan_emitted[i] = true;
             }
         }
@@ -1269,6 +1291,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             render_control_slot(&mut splitter.content, slots[slot_idx], ctx);
             slot_idx += 1;
             expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+            unit_seq += 1;
             continue;
         }
 
@@ -1285,6 +1308,17 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
 
         text_buf.push(c);
         let width = char_utf16_width(c);
+        if char_pos >= expected_utf16_pos.saturating_add(8) {
+            // 슬롯 없이 건너뛰는 갭(북마크·인라인 문자)도 순번에 센다.
+            unit_seq += (char_pos - expected_utf16_pos) / 8;
+            while para
+                .inline_ctrl_chars
+                .get(inline_idx)
+                .is_some_and(|c| c.slot < unit_seq)
+            {
+                inline_idx += 1;
+            }
+        }
         if char_pos >= expected_utf16_pos {
             expected_utf16_pos = char_pos.saturating_add(width);
         } else {
@@ -1310,6 +1344,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
                 // 않으면 다음 idx 에서 텍스트-끝 슬롯(newNum 등)이 이 8유닛 갭을
                 // 가로채 텍스트가 +8 밀린다 (143E 문단 0.14: char_offsets[3] 27→35).
                 expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                unit_seq += 1;
                 field_end_emitted[i] = true;
             }
         }
@@ -1338,6 +1373,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             }
             emit_field_end_at(&mut splitter, para, fr, expected_utf16_pos);
             expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+            unit_seq += 1;
             field_end_emitted[i] = true;
         }
     }
@@ -1352,6 +1388,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             splitter.cut_before(expected_utf16_pos);
             emit_orphan_field_end(&mut splitter.content, ofe);
             expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+            unit_seq += 1;
             orphan_emitted[i] = true;
         }
     }
@@ -1370,6 +1407,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
         let emitted_ctrl_idx = slot_ctrl_indices[slot_idx];
         slot_idx += 1;
         expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+        unit_seq += 1;
         // [Task #1893] 위에서 지연한 문단 끝 0-length 필드의 fieldEnd 를 자기
         // fieldBegin 슬롯 직후에 방출 — begin→end 순서 보존.
         for (i, fr) in para.field_ranges.iter().enumerate() {
@@ -1379,6 +1417,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             {
                 emit_field_end_at(&mut splitter, para, fr, expected_utf16_pos);
                 expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+                unit_seq += 1;
                 field_end_emitted[i] = true;
             }
         }
@@ -1388,6 +1427,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
         if !field_end_emitted[i] {
             emit_field_end_at(&mut splitter, para, fr, expected_utf16_pos);
             expected_utf16_pos = expected_utf16_pos.saturating_add(8);
+            unit_seq += 1;
             field_end_emitted[i] = true;
         }
     }
@@ -1436,7 +1476,9 @@ fn inferred_control_slot_count(para: &Paragraph) -> usize {
     from_char_count
         .max(from_offsets)
         .saturating_sub(para.field_ranges.len() as u32)
-        .saturating_sub(para.orphan_field_ends.len() as u32) as usize
+        .saturating_sub(para.orphan_field_ends.len() as u32)
+        // HWP5 인라인 제어 문자(제목 차례 표시 등)도 컨트롤 없는 8유닛 갭이다.
+        .saturating_sub(para.inline_ctrl_chars.len() as u32) as usize
 }
 
 /// HWPX 인라인 슬롯(U+FFFC 오브젝트 위치)을 점유하는 컨트롤인지 판정한다.

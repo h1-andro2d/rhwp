@@ -145,11 +145,13 @@ pub fn parse_paragraph(records: &[Record]) -> Result<Paragraph, BodyTextError> {
 
         match record.tag_id {
             tags::HWPTAG_PARA_TEXT => {
-                let (text, offsets, field_ranges, tab_ext) = parse_para_text(&record.data);
+                let (text, offsets, field_ranges, tab_ext, inline_ctrl_chars) =
+                    parse_para_text_with_inline(&record.data);
                 para.text = text;
                 para.char_offsets = offsets;
                 para.field_ranges = field_ranges;
                 para.tab_extended = tab_ext;
+                para.inline_ctrl_chars = inline_ctrl_chars;
                 para.has_para_text = true;
             }
             tags::HWPTAG_PARA_CHAR_SHAPE => {
@@ -269,7 +271,25 @@ fn parse_para_header(data: &[u8]) -> Paragraph {
 /// - 확장 컨트롤 문자: 8 code unit (16바이트) 차지
 /// - 인라인 컨트롤 문자: 1 code unit (2바이트) 차지
 fn parse_para_text(data: &[u8]) -> (String, Vec<u32>, Vec<FieldRange>, Vec<[u16; 7]>) {
+    let (text, char_offsets, field_ranges, tab_extended, _) = parse_para_text_with_inline(data);
+    (text, char_offsets, field_ranges, tab_extended)
+}
+
+/// `parse_para_text` + IR 객체가 없는 인라인 제어 문자(제목 차례 표시 등) 목록.
+#[allow(clippy::type_complexity)]
+fn parse_para_text_with_inline(
+    data: &[u8],
+) -> (
+    String,
+    Vec<u32>,
+    Vec<FieldRange>,
+    Vec<[u16; 7]>,
+    Vec<crate::model::paragraph::InlineCtrlChar>,
+) {
     let mut text = String::new();
+    // 8 code unit 항목 순번 — 인라인 제어 문자가 저장 때 같은 자리로 돌아가게 한다.
+    let mut slot_no: u32 = 0;
+    let mut inline_ctrl_chars = Vec::new();
     let mut char_offsets: Vec<u32> = Vec::new();
     let mut field_ranges: Vec<FieldRange> = Vec::new();
     let mut tab_extended: Vec<[u16; 7]> = Vec::new();
@@ -339,7 +359,23 @@ fn parse_para_text(data: &[u8]) -> (String, Vec<u32>, Vec<FieldRange>, Vec<[u16;
                 // extended 컨트롤 (CTRL_HEADER 있음) → ctrl_idx 증가
                 ctrl_idx += 1;
             }
-            // inline 컨트롤 (4-9, 19-20 중 0x04 제외): ctrl_idx 증가 없음
+            // inline 컨트롤 (4-9, 19-20 중 0x04 제외): ctrl_idx 증가 없음.
+            // IR 객체가 없으므로 원본 8 code unit 을 그대로 기억해 저장 때 되살린다.
+            if ch != 0x0003 && ch != 0x0004 && !is_extended_only_ctrl_char(ch) {
+                let mut data7 = [0u16; 7];
+                for (k, slot) in data7.iter_mut().enumerate() {
+                    let bp = pos + 2 + k * 2;
+                    if bp + 1 < data.len() {
+                        *slot = u16::from_le_bytes([data[bp], data[bp + 1]]);
+                    }
+                }
+                inline_ctrl_chars.push(crate::model::paragraph::InlineCtrlChar {
+                    slot: slot_no,
+                    code: ch,
+                    data: data7,
+                });
+            }
+            slot_no += 1;
             // 자동번호(0x12) / 새번호(0x12): 텍스트에 공백 placeholder 추가
             // → apply_auto_numbers_to_composed에서 "  " (연속 2공백)으로 번호 삽입
             if ch == 0x0012 {
@@ -398,7 +434,13 @@ fn parse_para_text(data: &[u8]) -> (String, Vec<u32>, Vec<FieldRange>, Vec<[u16;
         }
     }
 
-    (text, char_offsets, field_ranges, tab_extended)
+    (
+        text,
+        char_offsets,
+        field_ranges,
+        tab_extended,
+        inline_ctrl_chars,
+    )
 }
 
 /// extended 컨트롤 문자 여부 (CTRL_HEADER 레코드가 있는 컨트롤)

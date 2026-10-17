@@ -107,6 +107,10 @@ fn serialize_hwp_inner(
         serialize_file_header(&doc.header)
     };
 
+    // HWP3 변환본은 적재 때 파일 값을 보정해 IR 에 담는다. 다시 쓰는 부분만 파일 단위로 되돌린다.
+    let file_units = hwp3_variant_file_units(doc);
+    let doc = file_units.as_ref().unwrap_or(doc);
+
     // 2. DocInfo 직렬화
     let doc_info_bytes = serialize_doc_info(&doc.doc_info, &doc.doc_properties);
 
@@ -405,6 +409,70 @@ fn find_bin_data_info_with_compress<'a>(
     }
     // 못 찾으면 content에서 직접 추출 (문서 압축 플래그 따름)
     (content.id, &content.extension, doc_compressed)
+}
+
+/// HWP3→HWP5 변환본(`Document::is_hwp3_variant`)의 IR 을 파일 단위로 되돌린 사본.
+///
+/// 파서는 변환본을 열 때 (1) 문단 모양의 문단 위/아래 간격을 반으로 줄이고
+/// (2) 본문 LINE_SEG vertical_pos 에서 누적 문단 위 간격을 뺀다(`parser/mod.rs`).
+/// 원본 스트림을 그대로 쓰는 부분(raw_stream·`ParaShape::raw_data`)은 영향이 없지만,
+/// 다시 쓰는 구역·새 문단 모양은 보정된 값이 그대로 파일에 실려, 다시 열 때 보정이
+/// 한 번 더 걸린다 — 저장할 때마다 vpos 가 줄고(쪽 나눔 이동) 새 문단 간격이 반씩 준다.
+/// 되돌릴 것이 없으면 `None` (사본을 만들지 않는다).
+pub(crate) fn hwp3_variant_file_units(
+    doc: &crate::model::document::Document,
+) -> Option<crate::model::document::Document> {
+    if !doc.is_hwp3_variant {
+        return None;
+    }
+    let shapes_to_fix = doc.doc_info.raw_stream_dirty
+        && doc
+            .doc_info
+            .para_shapes
+            .iter()
+            .any(|ps| ps.raw_data.is_none());
+    let sections_to_fix = doc.sections.iter().any(|s| s.raw_stream.is_none());
+    if !shapes_to_fix && !sections_to_fix {
+        return None;
+    }
+    let mut out = doc.clone();
+    if shapes_to_fix {
+        for ps in out
+            .doc_info
+            .para_shapes
+            .iter_mut()
+            .filter(|ps| ps.raw_data.is_none())
+        {
+            ps.spacing_before = ps.spacing_before.saturating_mul(2);
+            ps.spacing_after = ps.spacing_after.saturating_mul(2);
+        }
+    }
+    let spacing_before = |id: u16| {
+        doc.doc_info
+            .para_shapes
+            .get(id as usize)
+            .map(|p| p.spacing_before)
+            .unwrap_or(0)
+    };
+    for section in out.sections.iter_mut().filter(|s| s.raw_stream.is_none()) {
+        // 적재 뒤 새로 생긴 문단은 보정 기록이 없다 — 파서와 같은 규칙(리셋 없이 앞 문단
+        // 누적 + 자기 문단 위 간격)으로 이어 계산한다.
+        let mut bias = 0i32;
+        for para in section.paragraphs.iter_mut() {
+            if para.line_segs.is_empty() {
+                continue;
+            }
+            bias = para
+                .hwp3_variant_vpos_bias
+                .unwrap_or_else(|| bias.saturating_add(spacing_before(para.para_shape_id)));
+            if bias != 0 {
+                for ls in para.line_segs.iter_mut() {
+                    ls.vertical_pos = ls.vertical_pos.saturating_add(bias);
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]

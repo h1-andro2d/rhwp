@@ -67,6 +67,27 @@ pub struct Paragraph {
     ///   호출 필수 (Clone 은 memo 를 함께 복제하지만, 복제본도 자기 상태 기준으로
     ///   유효하므로 안전 — 이후 변이 시 무효화 규약은 동일하게 적용).
     pub single_line_overflow_memo: SingleLineOverflowMemo,
+    /// HWP5 PARA_TEXT 의 인라인 제어 문자 중 IR 객체가 없는 것(제목 차례 표시 0x08 등).
+    ///
+    /// 8 code unit 을 차지하므로 `char_offsets` 에는 그 자리만큼 구멍이 남는다. 이 목록이
+    /// 없으면 저장기가 구멍을 다음 컨트롤로 메우거나(컨트롤이 앞으로 당겨짐) 버리고,
+    /// HWPX 저장기는 슬롯 수가 맞지 않아 컨트롤을 문단 끝으로 몰아낸다.
+    pub inline_ctrl_chars: Vec<InlineCtrlChar>,
+    /// HWP3 변환본 적재 보정(`normalize_variant_paragraph_vpos`)이 이 문단 LINE_SEG
+    /// vertical_pos 에서 뺀 값. 파일 단위로 되돌려 저장하기 위한 기록이며 직렬화하지 않는다.
+    /// `None` = 보정 대상이 아니었거나 적재 뒤 새로 만든 문단.
+    pub hwp3_variant_vpos_bias: Option<i32>,
+}
+
+/// PARA_TEXT 인라인 제어 문자 하나 (HWP 5.0 표 6 의 inline 4-8·19-20 중 필드 끝 0x04 제외).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineCtrlChar {
+    /// 문단 안에서 이 문자 앞에 나온 8 code unit 항목(확장 컨트롤·필드 시작/끝·인라인 문자) 수.
+    /// 글자 편집으로는 변하지 않으므로 저장기가 같은 자리에 되돌려 놓을 수 있다.
+    pub slot: u32,
+    pub code: u16,
+    /// 뒤따르는 7 code unit (컨트롤 ID·매개변수 — 원본 그대로)
+    pub data: [u16; 7],
 }
 
 /// [#4149] 단일줄 과밀 판정 memo 저장소 — `AtomicU64` 1개에 (폭 키, 판정) 패킹.
@@ -1220,6 +1241,10 @@ impl Paragraph {
             numbering_restart: None,
             // [#4149] 분할 산출 문단은 미판정으로 시작한다.
             single_line_overflow_memo: SingleLineOverflowMemo::default(),
+            // 인라인 제어 문자는 앞 문단에 남는다(순번이 그 문단 기준이라 끝에 되살아난다).
+            inline_ctrl_chars: Vec::new(),
+            // 새 문단 — 저장기가 앞 문단 보정값에서 이어 계산한다.
+            hwp3_variant_vpos_bias: None,
         }
     }
 

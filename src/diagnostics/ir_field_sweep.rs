@@ -647,6 +647,9 @@ fn sweep_paragraph(base: &str, a: &Paragraph, b: &Paragraph, out: &mut Divergenc
         numbering_restart,
         // [#4149] 파생 캐시 — IR 비교 대상 아님 (직렬화·저장 경로에도 미포함).
         single_line_overflow_memo: _,
+        inline_ctrl_chars,
+        // 적재 보정 기록 — 파일에 실리는 값이 아니다.
+        hwp3_variant_vpos_bias: _,
     } = a;
 
     macro_rules! f {
@@ -673,6 +676,7 @@ fn sweep_paragraph(base: &str, a: &Paragraph, b: &Paragraph, out: &mut Divergenc
     f!(has_para_text);
     f!(tab_extended);
     f!(numbering_restart);
+    f!(inline_ctrl_chars);
 
     sweep_controls(&format!("{base}.controls"), controls, &b.controls, out);
 }

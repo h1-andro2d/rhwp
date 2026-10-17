@@ -442,6 +442,12 @@ fn serialize_para_header_with_mask(
 ///   code_unit[1-2]: ctrl_id (u32 LE → 2 code units)
 ///   code_unit[3-6]: 0 (예약)
 ///   code_unit[7]: 제어 문자 코드 반복 (HWP 관례)
+/// IR 객체 없는 인라인 제어 문자를 원본 8 code unit 그대로 쓴다.
+fn push_inline_ctrl_char(code_units: &mut Vec<u16>, c: &crate::model::paragraph::InlineCtrlChar) {
+    code_units.push(c.code);
+    code_units.extend_from_slice(&c.data);
+}
+
 fn push_extended_ctrl(code_units: &mut Vec<u16>, ctrl_code: u16, ctrl_id: u32) {
     code_units.push(ctrl_code);
     // ctrl_id를 2개의 u16 code units로 변환 (LE)
@@ -545,6 +551,17 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
     let mut prev_end: u32 = 0;
     let mut tab_idx: usize = 0; // TAB 확장 데이터 인덱스
     let mut residue_shifts: Vec<GuideResidueShift> = Vec::new();
+    // 지금까지 쓴 8 code unit 항목 수와, IR 객체 없는 인라인 제어 문자(제목 차례 표시 등).
+    // 인라인 문자는 원본 순번(`slot`)이 돌아오고 그 자리에 갭이 있을 때 되살린다 — 갭을
+    // 다음 컨트롤에 내주면 컨트롤이 앞으로 당겨지고 문자는 사라진다.
+    let mut slot_no: u32 = 0;
+    let inline_chars = &para.inline_ctrl_chars;
+    let mut inline_idx: usize = 0;
+    let inline_due = |inline_idx: usize, slot_no: u32| {
+        inline_chars
+            .get(inline_idx)
+            .is_some_and(|c| c.slot <= slot_no)
+    };
 
     // field_ranges에서 FIELD_END 삽입 정보를 수집
     // 두 종류로 분류:
@@ -664,6 +681,7 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
             let (ctrl_code, ctrl_id) = control_char_code_and_id(&para.controls[ctrl_idx]);
             push_extended_ctrl(&mut code_units, ctrl_code, ctrl_id);
             ctrl_idx += 1;
+            slot_no += 1;
             prev_end = offset + 8;
             continue;
         }
@@ -676,8 +694,16 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
         // ① 여기서 **끝나는** 필드의 FIELD_END — 이 자리의 무엇보다 먼저 닫는다.
         //    (그래야 같은 자리에서 시작하는 다음 필드의 BEGIN 과 뒤엉키지 않는다)
         if let Some(markers) = field_ends.get(&i) {
+            let end_cus = markers.len() as u32 * 8;
+            while inline_due(inline_idx, slot_no) && prev_end + 8 + end_cus <= offset {
+                push_inline_ctrl_char(&mut code_units, &inline_chars[inline_idx]);
+                inline_idx += 1;
+                slot_no += 1;
+                prev_end += 8;
+            }
             for &marker in markers {
                 push_field_end_ctrl(&mut code_units, marker);
+                slot_no += 1;
                 prev_end += 8;
             }
         }
@@ -687,16 +713,26 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
             .get(&i)
             .map(|markers| markers.len() as u32 * 8)
             .unwrap_or(0);
-        while prev_end + 8 + pending_field_end_cus <= offset
-            && ctrl_idx < para.controls.len()
+        while prev_end + 8 + pending_field_end_cus <= offset {
+            if inline_due(inline_idx, slot_no) {
+                push_inline_ctrl_char(&mut code_units, &inline_chars[inline_idx]);
+                inline_idx += 1;
+                slot_no += 1;
+                prev_end += 8;
+                continue;
+            }
             // 필드를 여는 컨트롤은 자기 시작 위치 전에 방출하지 않는다.
-            && field_begin_pos
-                .get(&ctrl_idx)
-                .is_none_or(|&start| start <= i)
-        {
+            if ctrl_idx >= para.controls.len()
+                || field_begin_pos
+                    .get(&ctrl_idx)
+                    .is_some_and(|&start| start > i)
+            {
+                break;
+            }
             if emits_ctrl_header(&para.controls[ctrl_idx]) {
                 let (ctrl_code, ctrl_id) = control_char_code_and_id(&para.controls[ctrl_idx]);
                 push_extended_ctrl(&mut code_units, ctrl_code, ctrl_id);
+                slot_no += 1;
                 prev_end += 8;
             }
             ctrl_idx += 1;
@@ -713,6 +749,7 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
             if emits_ctrl_header(&para.controls[ctrl_idx]) {
                 let (ctrl_code, ctrl_id) = control_char_code_and_id(&para.controls[ctrl_idx]);
                 push_extended_ctrl(&mut code_units, ctrl_code, ctrl_id);
+                slot_no += 1;
                 prev_end += 8;
             }
             ctrl_idx += 1;
@@ -729,8 +766,16 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
         if let Some(markers) = empty_field_ends.get(&i) {
             for &marker in markers {
                 push_field_end_ctrl(&mut code_units, marker);
+                slot_no += 1;
                 prev_end += 8;
             }
+        }
+        // 갭의 남은 몫이 인라인 문자 자리면 글자 앞에 되살린다.
+        while inline_due(inline_idx, slot_no) && prev_end + 8 <= offset {
+            push_inline_ctrl_char(&mut code_units, &inline_chars[inline_idx]);
+            inline_idx += 1;
+            slot_no += 1;
+            prev_end += 8;
         }
 
         // 텍스트 문자 쓰기
@@ -787,9 +832,16 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
     // `char_shapes` 시프트 계산은 절대 위치가 필요하다 — `prev_end` 를 그대로 이어 써서
     // (메인 루프가 끝난 시점 값에서 시작) 8 code unit 씩 전진시킨다.
     while ctrl_idx < para.controls.len() {
+        while inline_due(inline_idx, slot_no) {
+            push_inline_ctrl_char(&mut code_units, &inline_chars[inline_idx]);
+            inline_idx += 1;
+            slot_no += 1;
+            prev_end += 8;
+        }
         if emits_ctrl_header(&para.controls[ctrl_idx]) {
             let (ctrl_code, ctrl_id) = control_char_code_and_id(&para.controls[ctrl_idx]);
             push_extended_ctrl(&mut code_units, ctrl_code, ctrl_id);
+            slot_no += 1;
             prev_end += 8;
         }
 
@@ -804,6 +856,7 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
         if let Some(end_markers) = trailing_end_after_ctrl.remove(&ctrl_idx) {
             for marker in end_markers {
                 push_field_end_ctrl(&mut code_units, marker);
+                slot_no += 1;
                 prev_end += 8;
             }
         }
@@ -821,6 +874,11 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
         for &marker in end_markers {
             push_field_end_ctrl(&mut code_units, marker);
         }
+    }
+
+    // 문단 끝 쪽 인라인 문자(제목 끝의 차례 표시 등)와, 편집으로 갭을 잃은 나머지.
+    for c in &inline_chars[inline_idx.min(inline_chars.len())..] {
+        push_inline_ctrl_char(&mut code_units, c);
     }
 
     // 문단 끝 마커
