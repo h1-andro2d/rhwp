@@ -167,6 +167,18 @@ pub struct DocumentCore {
     /// None = 전체 dirty (초기 로드 또는 전체 재구성 시).
     /// Some(vec) = vec[para_idx] = true이면 해당 문단만 재측정.
     pub(crate) dirty_paragraphs: Vec<Option<Vec<bool>>>,
+    /// [증분 조판] 켜져 있으면 편집 뒤 구역 전체가 아니라 고친 쪽 근처만 다시 조판한다
+    /// (`set_incremental_typeset`, 또는 native 에서 `RHWP_INCREMENTAL_TYPESET=1`).
+    pub(crate) incremental_typeset: bool,
+    /// [증분 조판] 구역별 지난 조판 기록.
+    pub(crate) typeset_resume: Vec<Option<crate::renderer::typeset::TypesetResumeCache>>,
+    /// [증분 조판] 다시 조판할 때마다 오르는 편집 세대와, 문단·구역이 마지막으로 바뀐 세대.
+    /// 스냅샷 복원 빠른 길이 "스냅샷 이후 바뀌었을 수 있는 문단" 만 깊게 비교하는 데 쓴다.
+    pub(crate) edit_gen: u64,
+    pub(crate) para_edit_gen: Vec<Vec<u64>>,
+    pub(crate) section_edit_gen: Vec<u64>,
+    /// 스냅샷 id → 저장 당시 `edit_gen`.
+    pub(crate) snapshot_edit_gen: Vec<(u32, u64)>,
     /// 구역별 문단→단 인덱스 매핑 (페이지네이션에서 결정)
     /// para_column_map[section_idx][para_idx] = column_index
     pub(crate) para_column_map: Vec<Vec<u16>>,
@@ -349,6 +361,12 @@ impl DocumentCore {
             dirty_sections: Vec::new(),
             measured_sections: Vec::new(),
             dirty_paragraphs: Vec::new(),
+            incremental_typeset: false,
+            typeset_resume: Vec::new(),
+            edit_gen: 0,
+            para_edit_gen: Vec::new(),
+            section_edit_gen: Vec::new(),
+            snapshot_edit_gen: Vec::new(),
             para_column_map: Vec::new(),
             deferred_pagination_revision: 0,
             deferred_pagination_descriptor: None,

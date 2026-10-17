@@ -915,9 +915,15 @@ const ROWBREAK_TRAILING_EMPTY_ROW_OVERFLOW_TOLERANCE_PX: f64 = 40.0;
 /// 제한된 tail 경로에만 허용하는 누적 높이 drift 완화값.
 const SAVED_TAIL_VPOS_OVERFLOW_TOLERANCE_PX: f64 = 128.0;
 
+#[derive(Clone)]
 struct TypesetState {
     /// 완성된 페이지 목록
     pages: Vec<PageContent>,
+    /// [증분 조판] 지금 처리 중인 본문 문단. 지난 쪽을 고친 기록(`retro_touches`)의 주인.
+    cur_para: usize,
+    /// [증분 조판] 이미 지나간 쪽(현재 쪽 이전)을 나중 문단이 고친 기록 (문단, 쪽).
+    /// 이어 조판할 지점·맞물림 지점을 고를 때 이 기록을 넘나드는 지점은 쓰지 않는다.
+    retro_touches: Vec<(usize, usize)>,
     /// 현재 단에 쌓이는 항목
     current_items: Vec<PageItem>,
     /// 현재 단에서 소비된 높이 (px)
@@ -1130,6 +1136,358 @@ struct TypesetState {
     vpos_col_anchor: f64,
     /// HWP3-origin 흐름에서는 vpos 보정에서 spacing_before 사전 차감을 생략한다(#1116).
     skip_spacing_before_prededuct: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [증분 조판] 고친 문단 근처부터 다시 조판하고, 지난 조판과 상태가 다시 맞물리면 멈춘다.
+//
+// 지난 조판은 쪽마다 "그 쪽의 첫 문단 경계" 에서 조판 상태를 하나씩 남긴다
+// (`TypesetCheckpoint`). 다음 편집 때는 고친 문단이 든 쪽보다 한 쪽 앞 기록에서 상태를
+// 되살려 조판을 이어 가고, 고친 범위를 한 쪽 이상 지난 문단 경계에서 상태가 지난 조판의
+// 같은 문단 기록과 같아지면 나머지 쪽은 지난 결과를 그대로 붙인다(쪽 번호만 민다).
+// 조판은 (상태, 남은 문단) 의 결정적 함수이므로 상태가 같으면 결과도 같다.
+// 지나간 쪽을 나중에 고치는 경로(각주 소급·어울림 소급)는 `retro_touches` 로 기록해
+// 그 기록을 가로지르는 지점에서는 이어 붙이지 않는다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// [증분 조판] 쪽의 첫 문단 경계에서 남긴 조판 상태.
+#[derive(Clone)]
+pub(crate) struct TypesetCheckpoint {
+    /// 이 경계 다음에 처리할 문단
+    para: usize,
+    /// 그때 `pages` 길이 (마지막이 열린 쪽)
+    pages_len: usize,
+    /// 그때 열린 쪽 (`pages.last()`) — 앞 쪽들은 지난 결과에서 가져온다
+    open_page: Option<PageContent>,
+    /// `pages` 를 비운 상태
+    state: TypesetState,
+    variant_prev_para_idx: Option<usize>,
+}
+
+/// [증분 조판] 한 구역의 지난 조판 결과와 이어 조판 기록.
+#[derive(Clone)]
+pub(crate) struct TypesetResumeCache {
+    checkpoints: Vec<TypesetCheckpoint>,
+    retro_touches: Vec<(usize, usize)>,
+    /// `typeset_section_with_variant` 반환값 그대로 (구역 간 쪽 번호 보정 전)
+    result: PaginationResult,
+    /// 문단별 조판 입력 지문 — 편집 경로가 dirty 로 표시하지 않고 바꾼 문단(뒤 문단 vpos 이동 등)을 찾는다
+    sigs: Vec<u64>,
+    inputs_key: String,
+    last_content_para_idx: Option<usize>,
+    has_stored_line_segs: bool,
+    omit_fresh_recalc_doc: bool,
+}
+
+impl TypesetResumeCache {
+    /// 기억하는 쪽 상태 수와 대략적 바이트 (측정용).
+    pub(crate) fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+}
+
+/// [증분 조판] 호출자가 주는 입력.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct IncrementalInput<'a> {
+    /// 지난 조판 기록 (같은 구역)
+    pub previous: Option<&'a TypesetResumeCache>,
+    /// 문단별 dirty 비트 (None = 전부 dirty → 처음부터)
+    pub dirty_paras: Option<&'a [bool]>,
+    /// 이번 조판 기록을 남길지
+    pub record: bool,
+}
+
+/// [증분 조판] 이번 조판에서 일어난 일.
+#[derive(Default)]
+pub(crate) struct IncrementalOutput {
+    pub cache: Option<TypesetResumeCache>,
+    /// 이어 조판을 시작한 문단 (None = 처음부터)
+    pub resumed_at_para: Option<usize>,
+    /// 지난 결과와 맞물린 문단 (None = 끝까지 조판)
+    pub converged_at_para: Option<usize>,
+    /// 실제로 조판 루프를 돈 문단 수
+    pub paras_typeset: usize,
+}
+
+fn dbg_eq<T: std::fmt::Debug>(a: &T, b: &T) -> bool {
+    format!("{a:?}") == format!("{b:?}")
+}
+
+/// 쪽 비교용 문자열 — HashMap 은 인스턴스마다 순회 순서가 달라 정렬해 찍고, 위치값(page_index)은 뺀다.
+fn canon_page_debug(page: &PageContent) -> String {
+    let mut p = page.clone();
+    p.page_index = 0;
+    let mut anchors = Vec::new();
+    for col in &mut p.column_contents {
+        let mut v: Vec<_> = std::mem::take(&mut col.wrap_anchors).into_iter().collect();
+        v.sort_by_key(|(k, _)| *k);
+        anchors.push(format!("{v:?}"));
+    }
+    format!("{p:?}{anchors:?}")
+}
+
+/// [증분 조판] 결과 비교용 문자열 (검증 모드). HashMap/HashSet 은 정렬해서 찍는다.
+pub(crate) fn canonical_pagination_debug(r: &PaginationResult) -> String {
+    let mut out = String::new();
+    for page in &r.pages {
+        out.push_str(&format!("#{} ", page.page_index));
+        out.push_str(&canon_page_debug(page));
+        out.push('\n');
+    }
+    let sorted = |set: &std::collections::HashSet<usize>| {
+        let mut v: Vec<_> = set.iter().copied().collect();
+        v.sort_unstable();
+        v
+    };
+    let mut heights: Vec<_> = r.pre_emitted_host_heights.iter().collect();
+    heights.sort_by_key(|(k, _)| **k);
+    out.push_str(&format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        r.wrap_around_paras,
+        sorted(&r.hidden_empty_paras),
+        sorted(&r.pre_emitted_host_paras),
+        heights,
+        r.endnotes,
+        r.endnote_para_sources
+    ));
+    out
+}
+
+/// 문단 하나의 조판 입력 지문. 편집은 dirty 비트로 잡히지만, vpos 재계산이 뒤 문단의
+/// LINE_SEG 를 옮기는 것은 비트로 남지 않으므로 그 값들을 섞는다.
+fn paragraph_typeset_sig(p: &Paragraph) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(p.text.len() as u64);
+    mix(p.controls.len() as u64);
+    mix(p.char_shapes.len() as u64);
+    mix(p.para_shape_id as u64);
+    mix(p.column_type as u64);
+    for ls in &p.line_segs {
+        mix(ls.text_start as u64);
+        mix(ls.vertical_pos as u32 as u64);
+        mix(ls.line_height as u32 as u64);
+        mix(ls.text_height as u32 as u64);
+        mix(ls.line_spacing as u32 as u64);
+        mix(ls.column_start as u32 as u64);
+        mix(ls.segment_width as u32 as u64);
+    }
+    h
+}
+
+/// 조판 루프가 끝난 뒤 `finalize_pages` 가 채우는 값. 지난 결과의 쪽을 다시 쓸 때 비워
+/// 두어야 이번 finalize 결과가 처음부터 조판한 것과 같아진다.
+fn clear_finalized_fields(page: &mut PageContent) {
+    page.page_number = 0;
+    page.active_header = None;
+    page.active_footer = None;
+    page.page_number_pos = None;
+    page.page_hide = None;
+}
+
+impl TypesetState {
+    /// [증분 조판] `pages` 를 뺀 사본 (쪽 경계 기록용).
+    fn checkpoint_snapshot(&mut self) -> TypesetState {
+        let pages = std::mem::take(&mut self.pages);
+        let mut snap = self.clone();
+        self.pages = pages;
+        snap.retro_touches.clear();
+        snap
+    }
+
+    /// [증분 조판] 이 상태(쪽 경계)가 기록과 같아 앞으로 같은 조판을 낳는가.
+    /// 쪽 수가 달라도 되는 값(열린 쪽의 page_index, 빈 줄 감추기 쪽 번호)은 상대값으로 본다.
+    fn resume_equivalent(&self, cp: &TypesetCheckpoint) -> bool {
+        let other = &cp.state;
+        let TypesetState {
+            pages,
+            cur_para: _,
+            retro_touches: _,
+            current_items,
+            current_height,
+            current_start_height,
+            current_endnote_flow,
+            prev_body_bottom_vpos,
+            flow_underrun,
+            stored_ladder_spacing_omitted,
+            omit_fresh_recalc_doc,
+            current_column,
+            col_count,
+            layout,
+            section_index,
+            square_band_bottom,
+            square_band_top,
+            current_footnote_height,
+            current_bottom_fixed_exclusion,
+            bottom_fixed_consumed_flow,
+            page_has_page_abs_top_table,
+            defer_host_line_item_para,
+            is_first_footnote_on_page,
+            current_page_has_footnote_separator,
+            footnote_separator_overhead,
+            footnote_between_notes_margin,
+            footnote_safety_margin,
+            section_has_no_footer,
+            current_zone_y_offset,
+            current_zone_layout,
+            on_first_multicolumn_page,
+            pending_body_wide_top_reserve,
+            visible_float_exclusions,
+            deferred_table_controls,
+            deferred_next_page_square_pictures,
+            page_start_square_pictures,
+            fragment_queued_table_footnotes,
+            reset_vpos_after_queued_table_footnote_page,
+            prefilled_paras,
+            pre_emitted_host_paras,
+            pre_emitted_host_heights,
+            skip_safety_margin_once,
+            skip_footnote_margin_once,
+            tail_overflow_tolerance_once,
+            strict_plain_text_fit_after_empty_host_float_once,
+            profile,
+            has_stored_line_segs,
+            hide_empty_line,
+            hidden_empty_lines,
+            hidden_empty_page_idx,
+            hidden_empty_paras,
+            endnotes,
+            endnote_paragraphs,
+            endnote_para_sources,
+            endnote_between_notes_hu,
+            endnote_separator_above_hu,
+            endnote_separator_below_hu,
+            wrap_around_cs,
+            wrap_around_sw,
+            wrap_around_table_para,
+            wrap_around_any_seg,
+            behind_float_table_para,
+            behind_pending_absorbs,
+            current_column_wrap_around_paras,
+            current_column_wrap_anchors,
+            current_zone_column_type,
+            current_zone_design_spacing_px,
+            vpos_page_base,
+            vpos_lazy_base,
+            vpos_page_base_stored,
+            vpos_ladder_dirty,
+            vpos_prev_layout_para,
+            vpos_prev_partial_table,
+            vpos_col_anchor,
+            skip_spacing_before_prededuct,
+        } = self;
+        let _ = (pages, hidden_empty_page_idx);
+        if !endnote_paragraphs.is_empty() || !other.endnote_paragraphs.is_empty() {
+            return false;
+        }
+        let rel = |idx: usize, len: usize| {
+            if idx == usize::MAX {
+                None
+            } else {
+                Some(len as isize - idx as isize)
+            }
+        };
+        if rel(self.hidden_empty_page_idx, self.pages.len())
+            != rel(other.hidden_empty_page_idx, cp.pages_len)
+        {
+            return false;
+        }
+        let open_eq = match (self.pages.last(), cp.open_page.as_ref()) {
+            (None, None) => true,
+            (Some(a), Some(b)) => canon_page_debug(a) == canon_page_debug(b),
+            _ => false,
+        };
+        let anchors =
+            |m: &std::collections::HashMap<usize, crate::renderer::pagination::WrapAnchorRef>| {
+                let mut v: Vec<_> = m.iter().collect();
+                v.sort_by_key(|(k, _)| **k);
+                format!("{v:?}")
+            };
+        open_eq
+            && anchors(current_column_wrap_anchors) == anchors(&other.current_column_wrap_anchors)
+            && dbg_eq(current_items, &other.current_items)
+            && *current_height == other.current_height
+            && *current_start_height == other.current_start_height
+            && *current_endnote_flow == other.current_endnote_flow
+            && *prev_body_bottom_vpos == other.prev_body_bottom_vpos
+            && *flow_underrun == other.flow_underrun
+            && *stored_ladder_spacing_omitted == other.stored_ladder_spacing_omitted
+            && *omit_fresh_recalc_doc == other.omit_fresh_recalc_doc
+            && *current_column == other.current_column
+            && *col_count == other.col_count
+            && dbg_eq(layout, &other.layout)
+            && *section_index == other.section_index
+            && *square_band_bottom == other.square_band_bottom
+            && *square_band_top == other.square_band_top
+            && *current_footnote_height == other.current_footnote_height
+            && *current_bottom_fixed_exclusion == other.current_bottom_fixed_exclusion
+            && *bottom_fixed_consumed_flow == other.bottom_fixed_consumed_flow
+            && *page_has_page_abs_top_table == other.page_has_page_abs_top_table
+            && *defer_host_line_item_para == other.defer_host_line_item_para
+            && *is_first_footnote_on_page == other.is_first_footnote_on_page
+            && *current_page_has_footnote_separator == other.current_page_has_footnote_separator
+            && *footnote_separator_overhead == other.footnote_separator_overhead
+            && *footnote_between_notes_margin == other.footnote_between_notes_margin
+            && *footnote_safety_margin == other.footnote_safety_margin
+            && *section_has_no_footer == other.section_has_no_footer
+            && *current_zone_y_offset == other.current_zone_y_offset
+            && dbg_eq(current_zone_layout, &other.current_zone_layout)
+            && *on_first_multicolumn_page == other.on_first_multicolumn_page
+            && *pending_body_wide_top_reserve == other.pending_body_wide_top_reserve
+            && dbg_eq(visible_float_exclusions, &other.visible_float_exclusions)
+            && dbg_eq(deferred_table_controls, &other.deferred_table_controls)
+            && dbg_eq(
+                deferred_next_page_square_pictures,
+                &other.deferred_next_page_square_pictures,
+            )
+            && dbg_eq(
+                page_start_square_pictures,
+                &other.page_start_square_pictures,
+            )
+            && *fragment_queued_table_footnotes == other.fragment_queued_table_footnotes
+            && *reset_vpos_after_queued_table_footnote_page
+                == other.reset_vpos_after_queued_table_footnote_page
+            && *prefilled_paras == other.prefilled_paras
+            && *pre_emitted_host_paras == other.pre_emitted_host_paras
+            && *pre_emitted_host_heights == other.pre_emitted_host_heights
+            && *skip_safety_margin_once == other.skip_safety_margin_once
+            && *skip_footnote_margin_once == other.skip_footnote_margin_once
+            && *tail_overflow_tolerance_once == other.tail_overflow_tolerance_once
+            && *strict_plain_text_fit_after_empty_host_float_once
+                == other.strict_plain_text_fit_after_empty_host_float_once
+            && dbg_eq(profile, &other.profile)
+            && *has_stored_line_segs == other.has_stored_line_segs
+            && *hide_empty_line == other.hide_empty_line
+            && *hidden_empty_lines == other.hidden_empty_lines
+            && *hidden_empty_paras == other.hidden_empty_paras
+            && dbg_eq(endnotes, &other.endnotes)
+            && dbg_eq(endnote_para_sources, &other.endnote_para_sources)
+            && *endnote_between_notes_hu == other.endnote_between_notes_hu
+            && *endnote_separator_above_hu == other.endnote_separator_above_hu
+            && *endnote_separator_below_hu == other.endnote_separator_below_hu
+            && *wrap_around_cs == other.wrap_around_cs
+            && *wrap_around_sw == other.wrap_around_sw
+            && *wrap_around_table_para == other.wrap_around_table_para
+            && *wrap_around_any_seg == other.wrap_around_any_seg
+            && *behind_float_table_para == other.behind_float_table_para
+            && dbg_eq(behind_pending_absorbs, &other.behind_pending_absorbs)
+            && dbg_eq(
+                current_column_wrap_around_paras,
+                &other.current_column_wrap_around_paras,
+            )
+            && dbg_eq(current_zone_column_type, &other.current_zone_column_type)
+            && *current_zone_design_spacing_px == other.current_zone_design_spacing_px
+            && *vpos_page_base == other.vpos_page_base
+            && *vpos_lazy_base == other.vpos_lazy_base
+            && *vpos_page_base_stored == other.vpos_page_base_stored
+            && *vpos_ladder_dirty == other.vpos_ladder_dirty
+            && *vpos_prev_layout_para == other.vpos_prev_layout_para
+            && *vpos_prev_partial_table == other.vpos_prev_partial_table
+            && *vpos_col_anchor == other.vpos_col_anchor
+            && *skip_spacing_before_prededuct == other.skip_spacing_before_prededuct
+    }
 }
 
 /// [Task #1363] 미주 높이 모델 SSOT 마이그레이션 단계 플래그(`RHWP_EN_SSOT`).
@@ -3480,6 +3838,8 @@ impl TypesetState {
     ) -> Self {
         Self {
             pages: Vec::new(),
+            cur_para: 0,
+            retro_touches: Vec::new(),
             current_items: Vec::new(),
             current_height: 0.0,
             current_start_height: 0.0,
@@ -3794,6 +4154,7 @@ impl TypesetState {
         source: FootnoteSource,
         content_height: f64,
     ) -> bool {
+        self.note_retro_touch(page_idx);
         let Some(page) = self.pages.get_mut(page_idx) else {
             return false;
         };
@@ -3835,6 +4196,7 @@ impl TypesetState {
         fragment: FootnoteFragment,
         content_height: f64,
     ) -> bool {
+        self.note_retro_touch(page_idx);
         let Some(page) = self.pages.get_mut(page_idx) else {
             return false;
         };
@@ -3894,6 +4256,13 @@ impl TypesetState {
         if let Some(page) = self.pages.last_mut() {
             page.layout
                 .update_footnote_area(self.current_footnote_height);
+        }
+    }
+
+    /// [증분 조판] 현재 쪽보다 앞 쪽을 고칠 때 부른다.
+    fn note_retro_touch(&mut self, page_idx: usize) {
+        if page_idx + 1 < self.pages.len() {
+            self.retro_touches.push((self.cur_para, page_idx));
         }
     }
 
@@ -3988,8 +4357,14 @@ impl TypesetState {
             _ => false,
         };
         if !self.current_items.iter().any(is_first_fragment) {
-            for page in self.pages.iter_mut() {
-                for col in page.column_contents.iter_mut() {
+            let found = self.pages.iter().position(|page| {
+                page.column_contents
+                    .iter()
+                    .any(|col| col.items.iter().any(is_first_fragment))
+            });
+            if let Some(page_idx) = found {
+                self.note_retro_touch(page_idx);
+                for col in self.pages[page_idx].column_contents.iter_mut() {
                     if col.items.iter().any(is_first_fragment) {
                         col.wrap_around_paras.push(wrap_para);
                         return;
@@ -5770,6 +6145,71 @@ impl TypesetEngine {
         force_break_before: &std::collections::HashSet<usize>,
         endnote_deferral: EndnoteDeferral<'_>,
     ) -> PaginationResult {
+        self.typeset_section_incremental(
+            paragraphs,
+            composed,
+            styles,
+            page_def,
+            column_def,
+            section_index,
+            measured_tables,
+            hide_empty_line,
+            profile,
+            skip_spacing_before_prededuct,
+            hwp3_origin_page_tolerance,
+            footnote_shape,
+            endnote_shape,
+            force_break_before,
+            endnote_deferral,
+            IncrementalInput::default(),
+        )
+        .0
+    }
+
+    /// `typeset_section_with_variant` + [증분 조판]. `inc.previous` 가 같은 구역의 지난 기록이고
+    /// 바뀐 문단 범위를 알 수 있으면 그 근처부터 이어 조판하고, 지난 결과와 상태가 맞물리면
+    /// 나머지 쪽을 재사용한다. 조건이 안 맞으면 처음부터 조판한다(결과는 언제나 같아야 한다).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn typeset_section_incremental(
+        &self,
+        paragraphs: &[Paragraph],
+        composed: &[ComposedParagraph],
+        styles: &ResolvedStyleSet,
+        page_def: &PageDef,
+        column_def: &ColumnDef,
+        section_index: usize,
+        measured_tables: &[MeasuredTable],
+        hide_empty_line: bool,
+        profile: crate::model::provenance::LayoutCompatibilityProfile,
+        skip_spacing_before_prededuct: bool,
+        hwp3_origin_page_tolerance: bool,
+        footnote_shape: Option<&FootnoteShape>,
+        endnote_shape: Option<&FootnoteShape>,
+        force_break_before: &std::collections::HashSet<usize>,
+        endnote_deferral: EndnoteDeferral<'_>,
+        inc: IncrementalInput<'_>,
+    ) -> (PaginationResult, IncrementalOutput) {
+        let inc_inputs_key = format!(
+            "{}|{:?}|{:?}|{}|{}|{:?}|{}|{}|{:?}|{:?}|{}|{}|{}|{}",
+            match endnote_deferral {
+                EndnoteDeferral::None => "none",
+                EndnoteDeferral::Suppress => "suppress",
+                EndnoteDeferral::RenderAll(_) => "all",
+            },
+            page_def,
+            column_def,
+            section_index,
+            hide_empty_line,
+            profile,
+            skip_spacing_before_prededuct,
+            hwp3_origin_page_tolerance,
+            footnote_shape,
+            endnote_shape,
+            styles.para_styles.len(),
+            styles.char_styles.len(),
+            self.dpi,
+            paragraphs.len(),
+        );
         // [#2424 프로파일] paginate_pass 와 같은 env var 로 하위 단계 게이트.
         #[cfg(not(target_arch = "wasm32"))]
         let issue2424_ts_enabled =
@@ -5881,7 +6321,122 @@ impl TypesetEngine {
         }
         let issue2424_loop_started = issue2424_ts_enabled.then(std::time::Instant::now);
 
-        for (para_idx, para) in paragraphs.iter().enumerate() {
+        // ── [증분 조판] 이어 조판 지점 고르기 ──
+        let inc_sigs: Vec<u64> = if inc.record || inc.previous.is_some() {
+            paragraphs.iter().map(paragraph_typeset_sig).collect()
+        } else {
+            Vec::new()
+        };
+        let fresh_has_stored_line_segs = st.has_stored_line_segs;
+        let fresh_omit_fresh_recalc_doc = st.omit_fresh_recalc_doc;
+        let mut inc_out = IncrementalOutput::default();
+        let mut inc_checkpoints: Vec<TypesetCheckpoint> = Vec::new();
+        let mut inc_start_para = 0usize;
+        // (지난 기록, 이어 조판을 시작한 기록 위치, 바뀐 범위)
+        let mut inc_resume: Option<(&TypesetResumeCache, usize, usize, usize)> = None;
+        if let (Some(old), Some(dirty_bits)) = (inc.previous, inc.dirty_paras) {
+            let usable = old.inputs_key == inc_inputs_key
+                && old.sigs.len() == paragraphs.len()
+                && old.last_content_para_idx == last_content_para_idx
+                && old.has_stored_line_segs == fresh_has_stored_line_segs
+                && old.omit_fresh_recalc_doc == fresh_omit_fresh_recalc_doc
+                && force_break_before.is_empty()
+                // RenderAll 만 다른 구역의 미주를 끌어온다 — 그때는 처음부터.
+                && matches!(endnote_deferral, EndnoteDeferral::None | EndnoteDeferral::Suppress);
+            let mut lo = usize::MAX;
+            let mut hi = 0usize;
+            if usable {
+                for (i, p) in paragraphs.iter().enumerate() {
+                    let dirty = dirty_bits.get(i).copied().unwrap_or(true)
+                        || inc_sigs[i] != old.sigs[i]
+                        || p.controls
+                            .iter()
+                            .any(|c| matches!(c, Control::Table(t) if t.dirty));
+                    if dirty {
+                        lo = lo.min(i);
+                        hi = hi.max(i);
+                    }
+                }
+            }
+            if usable && lo != usize::MAX {
+                // 고친 문단이 든 쪽의 기록 → 한 쪽 더 앞 (앞 문단의 앞보기 판단이 고친 문단을 볼 수 있다).
+                let containing = old.checkpoints.partition_point(|c| c.para <= lo);
+                let mut ci = containing.checked_sub(2);
+                while let Some(i) = ci {
+                    let cp = &old.checkpoints[i];
+                    // 이어 받을 앞 쪽들을 뒤 문단이 소급해 고쳤으면 쓸 수 없다.
+                    let retro_ok = !old
+                        .retro_touches
+                        .iter()
+                        .any(|&(pi, pg)| pi >= cp.para && pg + 1 < cp.pages_len);
+                    let prefill_ok = !cp.state.prefilled_paras.iter().any(|&p| p >= lo);
+                    if retro_ok && prefill_ok {
+                        break;
+                    }
+                    ci = i.checked_sub(1);
+                }
+                if let Some(i) = ci {
+                    let cp = &old.checkpoints[i];
+                    let mut restored = cp.state.clone();
+                    restored.pages = old.result.pages[..cp.pages_len.saturating_sub(1)].to_vec();
+                    for page in &mut restored.pages {
+                        clear_finalized_fields(page);
+                    }
+                    if let Some(open) = &cp.open_page {
+                        restored.pages.push(open.clone());
+                    }
+                    st = restored;
+                    variant_prev_para_idx = cp.variant_prev_para_idx;
+                    inc_start_para = cp.para;
+                    inc_resume = Some((old, i, lo, hi));
+                    inc_out.resumed_at_para = Some(cp.para);
+                }
+            }
+        }
+        let mut inc_last_cp_pages = usize::MAX;
+        let mut inc_cps_past_hi = 0usize;
+        let mut inc_converged: Option<usize> = None;
+
+        for (para_idx, para) in paragraphs.iter().enumerate().skip(inc_start_para) {
+            st.cur_para = para_idx;
+            // [증분 조판] 쪽의 첫 문단 경계: 지난 결과와 맞물렸는지 보고, 상태를 기록한다.
+            if (inc.record || inc_resume.is_some()) && st.pages.len() != inc_last_cp_pages {
+                inc_last_cp_pages = st.pages.len();
+                if let Some((old, _, _, hi)) = inc_resume {
+                    if para_idx > hi {
+                        inc_cps_past_hi += 1;
+                    }
+                    // 고친 범위를 한 쪽 이상 지나서야 본다 (뒤 문단의 되돌아보기가 고친 문단에 닿지 않게).
+                    if inc_cps_past_hi >= 2 {
+                        if let Ok(oi) = old.checkpoints.binary_search_by_key(&para_idx, |c| c.para)
+                        {
+                            let oc = &old.checkpoints[oi];
+                            let retro_ok = !old
+                                .retro_touches
+                                .iter()
+                                .any(|&(pi, pg)| pi >= para_idx && pg + 1 < oc.pages_len);
+                            if retro_ok
+                                && oc.variant_prev_para_idx == variant_prev_para_idx
+                                && st.resume_equivalent(oc)
+                            {
+                                inc_converged = Some(oi);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if inc.record {
+                    let open_page = st.pages.last().cloned();
+                    inc_checkpoints.push(TypesetCheckpoint {
+                        para: para_idx,
+                        pages_len: st.pages.len(),
+                        open_page,
+                        state: st.checkpoint_snapshot(),
+                        variant_prev_para_idx,
+                    });
+                }
+            }
+            inc_out.paras_typeset += 1;
             // [Task #1753] 지연 이월 표 직전에 선행 채움(prefill)으로 이미 배치된 문단 스킵.
             if st.prefilled_paras.contains(&para_idx) {
                 continue;
@@ -7081,6 +7636,7 @@ impl TypesetEngine {
                             };
                             match routed {
                                 Some((page_idx, col_idx)) => {
+                                    st.note_retro_touch(page_idx);
                                     if let Some(page) = st.pages.get_mut(page_idx) {
                                         if let Some(col) = page.column_contents.get_mut(col_idx) {
                                             col.items.push(item);
@@ -7613,6 +8169,94 @@ impl TypesetEngine {
             .unwrap_or_default();
         let issue2424_inloop_flush = issue2424_prof.deferred_flush.0;
 
+        // ── [증분 조판] 맞물림: 열린 쪽부터는 지난 결과(쪽 번호만 밀어서)를 붙인다 ──
+        if let (Some(oi), Some((old, resume_ci, _, _))) = (inc_converged, inc_resume) {
+            let oc = &old.checkpoints[oi];
+            let delta = st.pages.len() as isize - oc.pages_len as isize;
+            let shift = |idx: u32| (idx as isize + delta) as u32;
+            let mut pages = std::mem::take(&mut st.pages);
+            pages.truncate(pages.len().saturating_sub(1));
+            for page in &old.result.pages[oc.pages_len.saturating_sub(1)..] {
+                let mut page = page.clone();
+                page.page_index = shift(page.page_index);
+                clear_finalized_fields(&mut page);
+                pages.push(page);
+            }
+            Self::finalize_pages(
+                &mut pages,
+                &hf_entries,
+                &page_number_pos,
+                &new_page_numbers,
+                &page_hides,
+                section_index,
+            );
+            let result = PaginationResult {
+                pages,
+                wrap_around_paras: Vec::new(),
+                hidden_empty_paras: old.result.hidden_empty_paras.clone(),
+                pre_emitted_host_paras: old.result.pre_emitted_host_paras.clone(),
+                pre_emitted_host_heights: old.result.pre_emitted_host_heights.clone(),
+                endnotes: old.result.endnotes.clone(),
+                endnote_paragraphs: old.result.endnote_paragraphs.clone(),
+                endnote_para_sources: old.result.endnote_para_sources.clone(),
+                endnote_between_notes_hu: old.result.endnote_between_notes_hu,
+                endnote_separator_above_hu: old.result.endnote_separator_above_hu,
+                endnote_separator_below_hu: old.result.endnote_separator_below_hu,
+            };
+            inc_out.converged_at_para = Some(oc.para);
+            if inc.record {
+                let mut checkpoints: Vec<TypesetCheckpoint> = old.checkpoints[..resume_ci].to_vec();
+                checkpoints.append(&mut inc_checkpoints);
+                for cp in &old.checkpoints[oi..] {
+                    let mut cp = cp.clone();
+                    cp.pages_len = (cp.pages_len as isize + delta) as usize;
+                    if cp.state.hidden_empty_page_idx != usize::MAX {
+                        cp.state.hidden_empty_page_idx =
+                            (cp.state.hidden_empty_page_idx as isize + delta) as usize;
+                    }
+                    if let Some(open) = &mut cp.open_page {
+                        open.page_index = shift(open.page_index);
+                    }
+                    checkpoints.push(cp);
+                }
+                let mut retro_touches: Vec<(usize, usize)> = old
+                    .retro_touches
+                    .iter()
+                    .copied()
+                    .filter(|&(pi, _)| pi < inc_start_para)
+                    .collect();
+                retro_touches.extend(st.retro_touches.iter().copied());
+                retro_touches.extend(
+                    old.retro_touches
+                        .iter()
+                        .filter(|&&(pi, _)| pi >= oc.para)
+                        .map(|&(pi, pg)| (pi, (pg as isize + delta) as usize)),
+                );
+                inc_out.cache = Some(TypesetResumeCache {
+                    checkpoints,
+                    retro_touches,
+                    result: result.clone(),
+                    sigs: inc_sigs,
+                    inputs_key: inc_inputs_key,
+                    last_content_para_idx,
+                    has_stored_line_segs: fresh_has_stored_line_segs,
+                    omit_fresh_recalc_doc: fresh_omit_fresh_recalc_doc,
+                });
+            }
+            if let Some(started) = issue2424_ts_started {
+                eprintln!(
+                    "RHWP_INCREMENTAL_TYPESET sec={} resumed_at={:?} converged_at={} paras_typeset={} pages={} total_ms={:.2}",
+                    section_index,
+                    inc_out.resumed_at_para,
+                    oc.para,
+                    inc_out.paras_typeset,
+                    result.pages.len(),
+                    Issue2424TypesetProfile::ms(started.elapsed()),
+                );
+            }
+            return (result, inc_out);
+        }
+
         // source tail에 뒤따르는 본문이 없어 자연 page break가 일어나지 않은 경우에도,
         // deferred Square picture는 현재 쪽 FootnoteArea에 겹치지 않고 독립한 다음 physical
         // page를 가져야 한다. 일반 흐름을 되감지 않고 picture PageItem만 drain한다.
@@ -7748,7 +8392,9 @@ impl TypesetEngine {
             );
         }
 
-        PaginationResult {
+        let retro_now = std::mem::take(&mut st.retro_touches);
+        let behind_pending_left = !st.behind_pending_absorbs.is_empty();
+        let result = PaginationResult {
             pages: st.pages,
             wrap_around_paras: Vec::new(),
             hidden_empty_paras: st.hidden_empty_paras,
@@ -7760,7 +8406,47 @@ impl TypesetEngine {
             endnote_between_notes_hu: st.endnote_between_notes_hu,
             endnote_separator_above_hu: st.endnote_separator_above_hu,
             endnote_separator_below_hu: st.endnote_separator_below_hu,
+        };
+        // 루프 뒤 단계(미주 쪽·글뒤로 표 소급 흡수)가 결과를 바꾼 구역은 기록하지 않는다 —
+        // 그 쪽들을 이어 받으면 같은 처리가 한 번 더 걸린다.
+        if inc.record && result.endnotes.is_empty() && !behind_pending_left {
+            let mut checkpoints: Vec<TypesetCheckpoint> = Vec::new();
+            let mut retro_touches: Vec<(usize, usize)> = Vec::new();
+            if let Some((old, resume_ci, _, _)) = inc_resume {
+                checkpoints.extend_from_slice(&old.checkpoints[..resume_ci]);
+                retro_touches.extend(
+                    old.retro_touches
+                        .iter()
+                        .copied()
+                        .filter(|&(pi, _)| pi < inc_start_para),
+                );
+            }
+            checkpoints.append(&mut inc_checkpoints);
+            retro_touches.extend(retro_now);
+            inc_out.cache = Some(TypesetResumeCache {
+                checkpoints,
+                retro_touches,
+                result: result.clone(),
+                sigs: inc_sigs,
+                inputs_key: inc_inputs_key,
+                last_content_para_idx,
+                has_stored_line_segs: fresh_has_stored_line_segs,
+                omit_fresh_recalc_doc: fresh_omit_fresh_recalc_doc,
+            });
         }
+        if inc_resume.is_some() {
+            if let Some(started) = issue2424_ts_started {
+                eprintln!(
+                    "RHWP_INCREMENTAL_TYPESET sec={} resumed_at={:?} converged_at=None paras_typeset={} pages={} total_ms={:.2}",
+                    section_index,
+                    inc_out.resumed_at_para,
+                    inc_out.paras_typeset,
+                    result.pages.len(),
+                    Issue2424TypesetProfile::ms(started.elapsed()),
+                );
+            }
+        }
+        (result, inc_out)
     }
 
     /// [#2064 추출] 미주 fit/advance 메트릭 계산 (#1363 SSOT) — 라운드 5 산물의

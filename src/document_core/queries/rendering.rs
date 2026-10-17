@@ -705,6 +705,36 @@ fn assign_master_pages_for_section(
     }
 }
 
+/// [증분 조판] 다시 조판하는 구역에서 이번에 바뀐 문단의 편집 세대를 기록한다
+/// (dirty 비트·dirty 표). 이유를 알 수 없는 dirty(문단 비트 없음·구조 변경)는 구역 전체.
+fn record_edit_generation(
+    paras: &[Paragraph],
+    dirty_bits: Option<&[bool]>,
+    structural: bool,
+    gen: u64,
+    gens: &mut Vec<u64>,
+    section_gen: &mut u64,
+) {
+    let structural = structural || gens.len() != paras.len();
+    gens.resize(paras.len(), gen);
+    let mut any = false;
+    if let (false, Some(bits)) = (structural, dirty_bits) {
+        for (i, para) in paras.iter().enumerate() {
+            let table_dirty = para
+                .controls
+                .iter()
+                .any(|c| matches!(c, Control::Table(t) if t.dirty));
+            if bits.get(i).copied().unwrap_or(false) || table_dirty {
+                gens[i] = gen;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        *section_gen = gen;
+    }
+}
+
 /// 구역에 정의된 머리말/꼬리말 컨트롤로 다음 구역에 넘길 carry 를 갱신한다.
 ///
 /// 페이지 active_header 만 보면 쪽에 한 번도 쓰이지 않은 정의(예: 홀수 쪽 하나뿐인 구역의
@@ -3683,10 +3713,20 @@ impl DocumentCore {
         self.measured_tables.clear();
         self.measured_sections.clear();
         self.dirty_paragraphs.clear();
+        self.typeset_resume.clear();
         self.para_column_map.clear();
         self.invalidate_page_tree_cache();
         self.overflow_links_cache.borrow_mut().clear();
         self.paginate();
+    }
+
+    /// [증분 조판] 편집 뒤 고친 쪽 근처만 다시 조판할지. 끄면 기록도 버린다.
+    /// 결과는 켜고 끔과 무관하게 같아야 한다 — 검증은 `RHWP_INCREMENTAL_VERIFY=1`.
+    pub fn set_incremental_typeset(&mut self, enabled: bool) {
+        self.incremental_typeset = enabled;
+        if !enabled {
+            self.typeset_resume.clear();
+        }
     }
 
     /// Batch 모드가 아닐 때만 paginate를 실행한다.
@@ -4070,6 +4110,7 @@ impl DocumentCore {
             .filter(|dirty| *dirty)
             .count();
         let issue2424_invalidate_started = issue2424_profile_enabled.then(std::time::Instant::now);
+        self.edit_gen = self.edit_gen.wrapping_add(1);
         self.invalidate_page_tree_cache();
         let issue2424_invalidate_elapsed = issue2424_invalidate_started
             .map(|started| started.elapsed())
@@ -4157,6 +4198,16 @@ impl DocumentCore {
             self.dirty_paragraphs.push(None);
         }
         self.dirty_paragraphs.truncate(sec_count);
+        self.typeset_resume.resize_with(sec_count, || None);
+        #[cfg(not(target_arch = "wasm32"))]
+        let incremental_enabled = self.incremental_typeset
+            || std::env::var("RHWP_INCREMENTAL_TYPESET").is_ok_and(|v| v == "1");
+        #[cfg(target_arch = "wasm32")]
+        let incremental_enabled = self.incremental_typeset;
+        #[cfg(not(target_arch = "wasm32"))]
+        let incremental_verify = std::env::var("RHWP_INCREMENTAL_VERIFY").is_ok_and(|v| v == "1");
+        #[cfg(target_arch = "wasm32")]
+        let incremental_verify = false;
         // [#4325] 이번 패스에서 실제로 재측정한 구역만 표시한다. dirty가 아니어서 건너뛴
         // 구역은 표 dirty 플래그를 지우면 안 된다 — 지우는 범위와 소비하는 범위(측정 스킵)가
         // 어긋나면 그 구역의 표가 이후 dirty로 마킹돼도 이번 패스의 clear로 소실된다.
@@ -4366,7 +4417,27 @@ impl DocumentCore {
                     EndnoteDeferral::None
                 };
                 let typesetter = TypesetEngine::new(self.dpi);
-                typesetter.typeset_section_with_variant(
+                // [증분 조판] 문단 수가 그대로이고(삽입·병합은 아직 처음부터) 렌더 정규화본을
+                // 쓰지 않는 구역만 지난 기록을 이어 쓴다.
+                let incremental_section = incremental_enabled
+                    && norm.is_none()
+                    && self.para_offset.get(idx).copied().unwrap_or(0) == 0;
+                let previous = if incremental_section {
+                    self.typeset_resume.get(idx).and_then(|c| c.as_ref())
+                } else {
+                    None
+                };
+                let dirty_paras = self.dirty_paragraphs.get(idx).and_then(|d| d.as_deref());
+                if issue2424_profile_enabled && incremental_enabled && previous.is_none() {
+                    eprintln!(
+                        "RHWP_INCREMENTAL_SKIP sec={} normalized={} para_offset={} cached={}",
+                        idx,
+                        norm.is_some(),
+                        self.para_offset.get(idx).copied().unwrap_or(0),
+                        self.typeset_resume.get(idx).is_some_and(|c| c.is_some())
+                    );
+                }
+                let (typeset, inc_out) = typesetter.typeset_section_incremental(
                     para_src,
                     composed,
                     &self.styles,
@@ -4382,7 +4453,64 @@ impl DocumentCore {
                     Some(&section.section_def.endnote_shape),
                     force_breaks.get(idx).unwrap_or(&empty_breaks),
                     endnote_deferral,
-                )
+                    crate::renderer::typeset::IncrementalInput {
+                        previous,
+                        dirty_paras,
+                        record: incremental_section,
+                    },
+                );
+                let mut typeset = typeset;
+                let mut cache = inc_out.cache;
+                if incremental_verify && inc_out.resumed_at_para.is_some() {
+                    let full = typesetter.typeset_section_with_variant(
+                        para_src,
+                        composed,
+                        &self.styles,
+                        &section.section_def.page_def,
+                        &column_def,
+                        idx,
+                        &measured.tables,
+                        section.section_def.hide_empty_line,
+                        profile,
+                        hwp3_origin_flow_spacing_before,
+                        hwp3_origin_page_tolerance,
+                        Some(&section.section_def.footnote_shape),
+                        Some(&section.section_def.endnote_shape),
+                        force_breaks.get(idx).unwrap_or(&empty_breaks),
+                        EndnoteDeferral::None,
+                    );
+                    let (a, b) = (
+                        crate::renderer::typeset::canonical_pagination_debug(&typeset),
+                        crate::renderer::typeset::canonical_pagination_debug(&full),
+                    );
+                    if a != b {
+                        let at = a
+                            .bytes()
+                            .zip(b.bytes())
+                            .position(|(x, y)| x != y)
+                            .unwrap_or(0);
+                        eprintln!(
+                            "RHWP_INCREMENTAL_VERIFY_FAIL sec={} resumed_at={:?} converged_at={:?} pages {} vs {} first_diff_byte={} inc=..{}.. full=..{}..",
+                            idx,
+                            inc_out.resumed_at_para,
+                            inc_out.converged_at_para,
+                            typeset.pages.len(),
+                            full.pages.len(),
+                            at,
+                            &a[at.saturating_sub(120).min(a.len())..(at + 200).min(a.len())],
+                            &b[at.saturating_sub(120).min(b.len())..(at + 200).min(b.len())],
+                        );
+                        typeset = full;
+                        cache = None;
+                    } else {
+                        eprintln!(
+                            "RHWP_INCREMENTAL_VERIFY_OK sec={} resumed_at={:?} converged_at={:?} paras_typeset={}",
+                            idx, inc_out.resumed_at_para, inc_out.converged_at_para, inc_out.paras_typeset
+                        );
+                    }
+                }
+                self.typeset_resume[idx] = cache;
+                typeset
             };
             if let Some(started) = issue2424_typeset_started {
                 issue2424_typeset_elapsed += started.elapsed();
@@ -4405,6 +4533,19 @@ impl DocumentCore {
 
             self.measured_tables[idx] = measured.tables.clone();
             self.measured_sections[idx] = measured;
+            {
+                let sec_count = self.document.sections.len();
+                self.para_edit_gen.resize_with(sec_count, Vec::new);
+                self.section_edit_gen.resize(sec_count, 0);
+                record_edit_generation(
+                    &section.paragraphs,
+                    self.dirty_paragraphs.get(idx).and_then(|d| d.as_deref()),
+                    self.para_offset.get(idx).copied().unwrap_or(0) != 0,
+                    self.edit_gen,
+                    &mut self.para_edit_gen[idx],
+                    &mut self.section_edit_gen[idx],
+                );
+            }
 
             // ── 수렴 감지: 이전 페이지네이션과 비교하여 변경 흡수 지점 탐색 ──
             // 판단 후 검증: 수렴으로 복사한 결과를 full pagination과 비교하여 정합성 확인

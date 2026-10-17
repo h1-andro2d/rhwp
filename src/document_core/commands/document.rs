@@ -179,6 +179,12 @@ impl DocumentCore {
             dirty_sections: vec![true; sec_count],
             measured_sections: Vec::new(),
             dirty_paragraphs: Vec::new(),
+            incremental_typeset: false,
+            typeset_resume: Vec::new(),
+            edit_gen: 0,
+            para_edit_gen: Vec::new(),
+            section_edit_gen: Vec::new(),
+            snapshot_edit_gen: Vec::new(),
             para_column_map: Vec::new(),
             deferred_pagination_revision: 0,
             deferred_pagination_descriptor: None,
@@ -1682,6 +1688,7 @@ impl DocumentCore {
         let id = self.next_snapshot_id;
         self.next_snapshot_id += 1;
         self.snapshot_store.push((id, self.document.clone()));
+        self.snapshot_edit_gen.push((id, self.edit_gen));
         // 최대 100개 제한 — 초과 시 가장 오래된 스냅샷 제거.
         // [Task #2328] studio 히스토리(rhwp-studio/src/engine/history.ts 의
         // WASM_MAX_SNAPSHOTS)와 양방향 결합. 이 값을 studio 예산(MAX-2)보다 낮추면
@@ -1690,6 +1697,7 @@ impl DocumentCore {
         const MAX_SNAPSHOTS: usize = 100;
         while self.snapshot_store.len() > MAX_SNAPSHOTS {
             self.snapshot_store.remove(0);
+            self.snapshot_edit_gen.remove(0);
         }
         id
     }
@@ -1712,17 +1720,190 @@ impl DocumentCore {
             .iter()
             .position(|(sid, _)| *sid == id)
             .ok_or_else(|| HwpError::RenderError(format!("스냅샷 {} 없음", id)))?;
-        let (_, doc) = self.snapshot_store[idx].clone();
-        self.document = doc;
+        let doc = self.snapshot_store[idx].1.clone();
+        let snap_gen = self
+            .snapshot_edit_gen
+            .iter()
+            .find(|(sid, _)| *sid == id)
+            .map(|&(_, g)| g);
         self.bump_bin_data_epoch();
+        // [증분 조판] 구조가 같으면 달라진 문단만 갈아 끼우고 그 근처만 다시 조판한다.
+        let Some(doc) = self.restore_changed_paragraphs(doc, snap_gen) else {
+            return Ok(super::super::helpers::json_ok());
+        };
+        self.document = doc;
         // 문서를 통째로 갈아끼웠으므로 파생 상태는 전부 새 원본에서 다시 만든다.
         self.rebuild_derived_state();
         Ok(super::super::helpers::json_ok())
     }
 
+    /// [증분 조판] 스냅샷 복원 빠른 길. 구역·문단 수와 스타일 표가 지금 문서와 같으면 달라진
+    /// 문단만 표시해 다시 구성·측정·조판한다(`rebuild_derived_state` 는 문서 전체를 다시 만든다).
+    /// 조건이 안 맞으면 문서를 `Some` 으로 돌려준다 — 호출자가 전체 재구성으로 간다.
+    fn restore_changed_paragraphs(
+        &mut self,
+        mut doc: Document,
+        snap_gen: Option<u64>,
+    ) -> Option<Document> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let enabled = (self.incremental_typeset
+            || std::env::var("RHWP_INCREMENTAL_TYPESET").is_ok_and(|v| v == "1"))
+            && std::env::var("RHWP_UNDO_FASTPATH").map_or(true, |v| v != "0");
+        #[cfg(target_arch = "wasm32")]
+        let enabled = self.incremental_typeset;
+        let cur = &self.document;
+        if !enabled
+            || self.batch_mode
+            || cur.sections.len() != doc.sections.len()
+            || self.composed.len() != doc.sections.len()
+            || cur
+                .sections
+                .iter()
+                .zip(&doc.sections)
+                .any(|(a, b)| a.paragraphs.len() != b.paragraphs.len())
+        {
+            return Some(doc);
+        }
+        let Some(snap_gen) = snap_gen else {
+            return Some(doc);
+        };
+        let dbg = |v: &dyn std::fmt::Debug| format!("{v:?}");
+        let started = std::time::Instant::now();
+        let (a, b) = (&cur.doc_info, &doc.doc_info);
+        // 문단·글자 모양은 raw_data 를 뺀 PartialEq 가 있다. 나머지 표는 작아 Debug 로 충분하다.
+        let style_tables_same = a.para_shapes == b.para_shapes
+            && a.char_shapes == b.char_shapes
+            && a.tab_defs == b.tab_defs
+            && dbg(&a.styles) == dbg(&b.styles)
+            && dbg(&a.numberings) == dbg(&b.numberings)
+            && dbg(&a.bullets) == dbg(&b.bullets)
+            && dbg(&a.border_fills) == dbg(&b.border_fills)
+            && dbg(&a.font_faces) == dbg(&b.font_faces)
+            && cur.is_hwp3_variant == doc.is_hwp3_variant;
+        let styles_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let sections_same = cur
+            .sections
+            .iter()
+            .zip(&doc.sections)
+            .all(|(x, y)| dbg(&x.section_def) == dbg(&y.section_def));
+        if !style_tables_same || !sections_same {
+            if std::env::var("RHWP_UNDO_FASTPATH_DEBUG").is_ok() {
+                eprintln!("UNDO_FASTPATH reject style_tables_same={style_tables_same} sections_same={sections_same}");
+            }
+            return Some(doc);
+        }
+        // 얕은 비교(서식 없이 값만): 모든 문단. 컨트롤 깊은 비교(Debug): 스냅샷 뒤 다시 조판된
+        // 문단(또는 구역 전체가 바뀐 구역)만 — 그 밖의 문단은 편집 경로가 건드리지 않았다.
+        let seg_same = |x: &LineSeg, y: &LineSeg| {
+            x.text_start == y.text_start
+                && x.vertical_pos == y.vertical_pos
+                && x.line_height == y.line_height
+                && x.text_height == y.text_height
+                && x.baseline_distance == y.baseline_distance
+                && x.line_spacing == y.line_spacing
+                && x.column_start == y.column_start
+                && x.segment_width == y.segment_width
+                && x.tag == y.tag
+        };
+        let shallow_same = |x: &Paragraph, y: &Paragraph| {
+            x.text == y.text
+                && x.char_offsets == y.char_offsets
+                && x.para_shape_id == y.para_shape_id
+                && x.style_id == y.style_id
+                && x.column_type == y.column_type
+                && x.controls.len() == y.controls.len()
+                && x.tab_extended == y.tab_extended
+                && x.inline_ctrl_chars == y.inline_ctrl_chars
+                && x.char_shapes.len() == y.char_shapes.len()
+                && x.char_shapes
+                    .iter()
+                    .zip(&y.char_shapes)
+                    .all(|(c, d)| c.start_pos == d.start_pos && c.char_shape_id == d.char_shape_id)
+                && x.line_segs.len() == y.line_segs.len()
+                && x.line_segs
+                    .iter()
+                    .zip(&y.line_segs)
+                    .all(|(c, d)| seg_same(c, d))
+                && x.field_ranges.len() == y.field_ranges.len()
+                && x.field_ranges.iter().zip(&y.field_ranges).all(|(c, d)| {
+                    c.start_char_idx == d.start_char_idx
+                        && c.end_char_idx == d.end_char_idx
+                        && c.control_idx == d.control_idx
+                })
+                && x.range_tags.len() == y.range_tags.len()
+                && x.range_tags
+                    .iter()
+                    .zip(&y.range_tags)
+                    .all(|(c, d)| c.start == d.start && c.end == d.end && c.tag == d.tag)
+                && dbg(&x.numbering_restart) == dbg(&y.numbering_restart)
+        };
+        let deep_same = |x: &Paragraph, y: &Paragraph| {
+            x.controls.is_empty() || dbg(&x.controls) == dbg(&y.controls)
+        };
+        let changed: Vec<Vec<usize>> = cur
+            .sections
+            .iter()
+            .zip(&doc.sections)
+            .enumerate()
+            .map(|(si, (x, y))| {
+                let section_touched = self.section_edit_gen.get(si).is_none_or(|&g| g > snap_gen);
+                let para_gens = self.para_edit_gen.get(si);
+                x.paragraphs
+                    .iter()
+                    .zip(&y.paragraphs)
+                    .enumerate()
+                    .filter(|(pi, (p, q))| {
+                        let touched = section_touched
+                            || para_gens
+                                .and_then(|g| g.get(*pi))
+                                .is_none_or(|&g| g > snap_gen);
+                        !shallow_same(p, q) || (touched && !deep_same(p, q))
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect();
+        if std::env::var("RHWP_UNDO_FASTPATH_DEBUG").is_ok() {
+            eprintln!(
+                "UNDO_FASTPATH changed={changed:?} compare_ms={:.2} styles_ms={:.2}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                styles_ms
+            );
+        }
+        // 복원본 표는 dirty 가 꺼진 채 저장돼 있다 — 달라진 문단의 표는 다시 재야 한다.
+        for (si, paras) in changed.iter().enumerate() {
+            for &pi in paras {
+                for c in &mut doc.sections[si].paragraphs[pi].controls {
+                    if let Control::Table(t) = c {
+                        t.dirty = true;
+                    }
+                }
+            }
+        }
+        self.document = doc;
+        self.invalidate_page_tree_cache();
+        self.overflow_links_cache.borrow_mut().clear();
+        // 렌더 정규화본(셀 경로 overlay 포함)은 문서 단위 세대로 다시 만든다 — 바뀐 구역의
+        // revision 은 아래 recompose 가 올린다. 손대지 않은 구역은 다시 조판하지 않는다.
+        self.render_normalization.document_epoch =
+            self.render_normalization.document_epoch.wrapping_add(1);
+        self.render_normalization.path_revisions.clear();
+        for (si, paras) in changed.iter().enumerate() {
+            if paras.is_empty() {
+                continue;
+            }
+            for &pi in paras {
+                self.recompose_paragraph(si, pi);
+            }
+        }
+        self.paginate_if_needed();
+        None
+    }
+
     /// 지정 ID의 스냅샷을 저장소에서 제거하여 메모리를 해제한다.
     pub fn discard_snapshot_native(&mut self, id: u32) {
         self.snapshot_store.retain(|(sid, _)| *sid != id);
+        self.snapshot_edit_gen.retain(|(sid, _)| *sid != id);
     }
 
     pub fn measure_width_diagnostic_native(
